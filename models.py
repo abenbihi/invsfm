@@ -42,9 +42,15 @@ class Net(object):
     # Load weights from an npz file
     def load(self,sess,fname=None):
         wts = np.load(fname)
+        #print("self.weights:")
+        #print(list(self.weights.keys()))
+        #print("file weights:")
+        #print(list(wts.keys()))
+
         ops = [v.assign(wts[k].astype(np.float32)).op
                for k,v in self.weights.items() if k in wts]
         if len(ops) > 0:
+            #print("# ops: %d"%(len(ops)))
             sess.run(ops)
 
     # Get all trainable weights

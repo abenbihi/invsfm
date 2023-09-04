@@ -23,11 +23,23 @@
 # demo_colmap.py
 # Demo script for running pre-trained models on data loaded directly from colmap sparse reconstruction files
 # Author: Francesco Pittaluga
+# Editor: Assia Benbihi
+
 
 import os
 import sys
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
 import tensorflow as tf
+
+session_conf = tf.ConfigProto(
+        device_count={'CPU' : 1, 'GPU' : 0},
+        allow_soft_placement=True,
+        log_device_placement=False
+        )
+
+#import cv2
 import numpy as np
 from PIL import Image, ImageFont, ImageDraw
 
@@ -40,13 +52,13 @@ from models import VisibNet
 from models import CoarseNet
 from models import RefineNet
 
-
 def create_parent_dir(path):
     parent_dir = os.path.dirname(path)
     if not os.path.exists(parent_dir):
         os.makedirs(parent_dir)
 
 
+################################################################################
 def load_points_colmap(database_fp,points3D_fp):
     
     db = database.COLMAPDatabase.connect(database_fp)
@@ -130,24 +142,19 @@ def load_points_colmap_only(database_fp,points3D_fp):
 
 
 def main(prm):
+    # Prepare paths
     # set paths for model wts
     vnet_wts_fp = 'wts/pretrained/{}/visibnet.model.npz'.format(prm.input_attr)
     cnet_wts_fp = 'wts/pretrained/{}/coarsenet.model.npz'.format(prm.input_attr)
     rnet_wts_fp = 'wts/pretrained/{}/refinenet.model.npz'.format(prm.input_attr)
     
-    ## set paths for colmap files
-    #scene = 'nyu_bedroom_0041' if prm.dataset == 'nyu' else 'megadepth_0117_dense0'
-    #cmap_database_fp = 'data/demo_colmap_outputs/{}/database.db'.format(scene)
-    #cmap_points3D_fp = 'data/demo_colmap_outputs/{}/points3D.bin'.format(scene)
-    #cmap_cameras_fp = 'data/demo_colmap_outputs/{}/cameras.bin'.format(scene)
-    #cmap_images_fp = 'data/demo_colmap_outputs/{}/images.bin'.format(scene)
-    
+    # set paths for original colmap files
     cmap_database_fp = '%s/database_with_desc.db'%(prm.colmap_model_path)
     cmap_points3D_fp = '%s/points3D.bin'%(prm.colmap_model_path)
     cmap_cameras_fp = '%s/cameras.bin'%(prm.colmap_model_path)
     cmap_images_fp = '%s/images.bin'%(prm.colmap_model_path)
  
-
+    # set paths for recovered colmap files
     rec_cmap_database_fp = '%s/database_with_desc.db'%(prm.rec_colmap_model_path)
     rec_cmap_points3D_fp = '%s/points3D.bin'%(prm.rec_colmap_model_path)
     rec_cmap_cameras_fp = '%s/cameras.bin'%(prm.rec_colmap_model_path)
@@ -158,51 +165,27 @@ def main(prm):
     # Load point cloud with per-point sift descriptors and rgb features from
     # colmap database and points3D.bin file from colmap sparse reconstruction
     print('Loading point cloud...')
-    #pcl_xyz, pcl_rgb, pcl_sift = ld.load_points_colmap(cmap_database_fp, cmap_points3D_fp)
 
     # use original rec
     if prm.mode == "original":
+        # use original descriptors AND original point clouds
         pcl_xyz, pcl_rgb, pcl_sift = load_points_colmap(cmap_database_fp, cmap_points3D_fp)
     else:
-        # use original descriptors and reconstructed point cloud 
+        # use original descriptors 
         _, _, pcl_sift = load_points_colmap(cmap_database_fp, cmap_points3D_fp)
+        # But use the reconstructed points
         pcl_xyz, pcl_rgb = load_points_colmap_only(rec_cmap_database_fp, rec_cmap_points3D_fp)
         print('Done!')
 
-    #return
-    
     # Load camera matrices and from images.bin and cameras.bin files from
     # colmap sparse reconstruction
     print('Loading cameras...')
     K,R,T,h,w,image_names = ld.load_cameras_colmap(cmap_images_fp, cmap_cameras_fp)
     print('Done!')
-    
-    # Generate projections
-    proj_depth = []
-    proj_sift = [] 
-    proj_rgb = []
-    proj_names = []
-    indices = list(range(len(K))[::(len(K)//prm.num_samples)])
-    print(indices)
 
-    for i in indices:
-        print("%d / %d"%(i, len(K)))
-        proj_mat = K[i].dot(np.hstack((R[i],T[i])))
-        pdepth, prgb, psift = ld.project_points(pcl_xyz, pcl_rgb, pcl_sift,
-                                                proj_mat, h[i], w[i], prm.scale_size, prm.crop_size)    
-        proj_depth.append((pdepth)[None,...])
-        proj_sift.append((psift)[None,...])
-        proj_rgb.append((prgb)[None,...])
+    # ['seq2/frame00008.png', 'seq2/frame00007.png', 'seq2/frame00005.png' ...
+    print(image_names)
 
-        proj_names.append(image_names[i])
-        print(image_names[i])
-        
-    proj_depth = np.vstack(proj_depth)
-    proj_sift = np.vstack(proj_sift)
-    proj_rgb = np.vstack(proj_rgb)
-    
-    print("Data preparation OK")
-    
     ################################################################################
     
     # Build Graph
@@ -255,7 +238,7 @@ def main(prm):
     rpred = (rpred+1.)*127.5
     
     ################################################################################
-    
+
     # Run Graph
     sess=tf.Session()
     try: init_all_vars = tf.global_variables_initializer()
@@ -269,38 +252,43 @@ def main(prm):
               cnet.unset_ifdo,
               rnet.unset_ifdo])
     
-    # Run cnet
-    for i in range(prm.num_samples):
-        print("Run %d / %d"%(i, prm.num_samples))
-        #fp = 'viz/cambridge/%s/%s_%s'%(
-        fp = '%s/%s_%s'%(
-                prm.output_path,
-                #prm.scene,
-                prm.input_attr,
-                proj_names[i].replace("/","_"))
-        print("Save to %s"%fp)
-        #print(proj_names[i])
+    ################################################################################
 
-        vpred_img = []
-        cpred_img = []
-        rpred_img = []
-        valid_img = []
+    # Inference
 
-        fd = {proj_depth_p:proj_depth[i:i+1],
-              proj_rgb_p:proj_rgb[i:i+1],
-              proj_sift_p:proj_sift[i:i+1]}
+    # Set the indices of the image to process
+    # TODO: get indices from user-specified image list
+    indices = []
+    num_images = len(K)
+    if prm.num_samples < num_images:
+        indices = list(range(len(K))[::(len(K)//prm.num_samples)])
+    else:
+        indices = np.arange(0, num_images)
+    print(indices)
+    
+    # TODO: batchify this
+    for i in indices:
+        print("Run %d / %d - #images: %d"%(i, prm.num_samples, num_images))
+
+        #print("%d / %d"%(i, len(K)))
+        proj_mat = K[i].dot(np.hstack((R[i],T[i])))
+        pdepth, prgb, psift = ld.project_points(pcl_xyz, pcl_rgb, pcl_sift,
+                proj_mat, h[i], w[i], prm.scale_size, prm.crop_size)    
+        image_name = image_names[i]
+
+        fd = {proj_depth_p: pdepth[None,...],
+              proj_rgb_p:prgb[None,...],
+              proj_sift_p:psift[None,...]
+            }
         out = sess.run([vpred,cpred,rpred,valid],feed_dict=fd)
-        vpred_img.append(out[0])
-        cpred_img.append(out[1])
-        rpred_img.append(out[2])
-        valid_img.append(out[3])
+        vpred_img = out[0]
+        cpred_img = out[1]
+        rpred_img = out[2]
+        valid_img = out[3]
+        
+        ################################################################################
 
-        vpred_img = np.vstack(vpred_img)
-        cpred_img = np.vstack(cpred_img)
-        rpred_img = np.vstack(rpred_img)
-        valid_img = np.vstack(valid_img)
-
-        img_path = "%s/%s"%(prm.image_path, proj_names[i])
+        img_path = "%s/%s"%(prm.image_path, image_name)
         print("img_path: %s"%img_path)
         original_img = Image.open(img_path)
         # resize
@@ -308,8 +296,6 @@ def main(prm):
         print(out[0].shape)
         original_img = original_img.resize((new_w, new_h))
         original_img = np.array(original_img)
-
-        ################################################################################
         
         # Generate visibnet visualization
         vpred_np = np.vstack(vpred_img)
@@ -319,41 +305,39 @@ def main(prm):
         vpred_img[np.dstack((valid_np,valid_np,valid_np))] = 0.
         vpred_img[np.dstack((np.logical_and(valid_np,np.logical_not(vpred_np)),zero,zero))] = 255.
         vpred_img[np.dstack((zero,zero,np.logical_and(valid_np,vpred_np)))] = 255.
-        
-        # Build results montage
-        header_size = 60
-        mntg = np.hstack((vpred_img.astype(np.uint8),
-                          np.vstack(cpred_img).astype(np.uint8),
-                          np.vstack(rpred_img).astype(np.uint8),
-                          original_img.astype(np.uint8),
-                          ))
-        #header_bot = np.ones((header_size,prm.crop_size*3,3))*127.
-        #header_top = np.zeros((header_size,prm.crop_size*3,3))
-        header_bot = np.ones((header_size,prm.crop_size*4,3))*127.
-        header_top = np.zeros((header_size,prm.crop_size*4,3))
 
-        mntg = np.vstack((header_top,header_bot,mntg))
+        vpred_img = vpred_img.astype(np.uint8)
+        cpred_img = cpred_img.astype(np.uint8)
+        rpred_img = rpred_img.astype(np.uint8)
+        cpred_img = np.squeeze(cpred_img)
+        rpred_img = np.squeeze(rpred_img)
+        print(vpred_img.shape)
+        print(cpred_img.shape)
+        print(rpred_img.shape)
         
-        # Add titles to montage header
-        mntg = Image.fromarray(mntg.astype(np.uint8))
-        im_draw = ImageDraw.Draw(mntg)
-        font = ImageFont.truetype("FreeMonoBold.ttf", 36)
-        column_titles = ['VisibNet Prediction','CoarseNet Prediction','RefineNet Prediction']
-        figure_title = 'Input Attributes: ' + prm.input_attr.replace('_',', ')
-        for i in range(len(column_titles)):
-            xpos = prm.crop_size*i + prm.crop_size/2 - font.getsize(column_titles[i])[0]/2
-            im_draw.text((xpos,70), column_titles[i], font=font, fill=(255,255,255))
-        xpos = header_top.shape[1]/2-font.getsize(figure_title)[0]/2
-        im_draw.text((xpos,10), figure_title, font=font, fill=(255,255,255))
+        # Save outputs to files
+        root_output_path = "%s/%s"%(
+                prm.output_path,
+                image_name.split(".")[0])
+        print("Save to %s"%root_output_path)
+
+        output_path = "%s_vpred.png"%root_output_path 
+        create_parent_dir(output_path)
+        out_img = Image.fromarray(vpred_img.astype(np.uint8))
+        out_img.save(output_path)
+        print('Saved vpred %s'%output_path)
         
-        # Save montage
-        #print(i)
-        #print(len(proj_names))
-        print(fp)
-        create_parent_dir(fp)
-        print('Saving visualization to {}...'.format(fp))
-        mntg.save(fp)
-        print('Done!')
+        output_path = "%s_cpred.png"%root_output_path 
+        create_parent_dir(output_path)
+        out_img = Image.fromarray(cpred_img.astype(np.uint8))
+        out_img.save(output_path)
+        print('Saved cpred %s'%output_path)
+        
+        output_path = "%s_rpred.png"%root_output_path 
+        create_parent_dir(output_path)
+        out_img = Image.fromarray(rpred_img.astype(np.uint8))
+        out_img.save(output_path)
+        print('Saved rpred %s'%output_path)
 
 
 if __name__=="__main__":
